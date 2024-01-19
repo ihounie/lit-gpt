@@ -1,5 +1,5 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-
+import math
 import os
 import sys
 import time
@@ -11,7 +11,10 @@ import torch
 from lightning.fabric.loggers import CSVLogger
 from lightning.fabric.plugins import BitsandbytesPrecision
 from lightning.fabric.strategies import FSDPStrategy
-from lightning.fabric.utilities import ThroughputMonitor
+from lightning.fabric.utilities import ThroughputMonitor, measure_flops
+from lightning.pytorch.loggers import WandbLogger
+from torchmetrics.aggregation import RunningMean
+
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -37,13 +40,15 @@ log_interval = 1
 devices = 1
 
 # Hyperparameters
-learning_rate = 3e-4
+learning_rate = 3e-5
 batch_size = 128
 micro_batch_size = 4
-gradient_accumulation_iters = batch_size // micro_batch_size
+gradient_accumulation_iters = int(batch_size // micro_batch_size)
 assert gradient_accumulation_iters > 0
 max_seq_length = None  # assign value to truncate
-max_iters = 50000  # train dataset size
+epoch_size = 1468252  # train dataset size
+num_epochs = 5
+max_iters = num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
@@ -56,26 +61,19 @@ lora_mlp = False
 lora_head = False
 warmup_steps = 100
 
+min_lr = 1e-6
+warmup_iters = warmup_steps * gradient_accumulation_iters
+
+
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
 
 def setup(
-    data_dir: Path = Path("data/alpaca"),
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
-    out_dir: Path = Path("out/lora/alpaca"),
-    precision: Optional[str] = None,
+    data_dir: Path = Path("data/ultrachat3"),
+    checkpoint_dir: Path = Path("checkpoints/lit-tiny-llama/lit-tiny-llama-3.0T"),
+    out_dir: Path = Path("out/lora/tiny-llama-ultrachat-tuned-small-lr"),
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
 ) -> None:
-    precision = precision or get_default_supported_precision(training=True)
-
-    plugins = None
-    if quantize is not None and quantize.startswith("bnb."):
-        if "mixed" in precision:
-            raise ValueError("Quantization and mixed precision is not supported.")
-        dtype = {"16-true": torch.float16, "bf16-true": torch.bfloat16, "32-true": torch.float32}[precision]
-        plugins = BitsandbytesPrecision(quantize[4:], dtype)
-        precision = None
-
     if devices > 1:
         if quantize:
             raise NotImplementedError(
@@ -92,8 +90,10 @@ def setup(
     else:
         strategy = "auto"
 
-    logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
+    # logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
+    logger = WandbLogger(project="tinyllama-finetune", name="lit-tiny-llama-1.1b")
+
+    fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-true", loggers=logger)
     fabric.print(hparams)
     fabric.launch(main, data_dir, checkpoint_dir, out_dir)
 
@@ -106,13 +106,13 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
     if fabric.global_rank == 0:
         os.makedirs(out_dir, exist_ok=True)
 
-    train_data = torch.load(data_dir / "train.pt")
-    val_data = torch.load(data_dir / "test.pt")
+    train_data = torch.load(data_dir / "train.bin")
+    val_data = torch.load(data_dir / "test.bin")
 
     if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
     config = Config.from_name(
-        name=checkpoint_dir.name,
+        name="tiny-llama-1.1b",
         r=lora_r,
         alpha=lora_alpha,
         dropout=lora_dropout,
@@ -171,12 +171,28 @@ def train(
     out_dir: Path,
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
-    longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
-    model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
-    fabric.print(
-        f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
-        f" {model.max_seq_length} and context length is {model.config.block_size}"
-    )
+    # longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
+    # model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
+    # fabric.print(
+    #     f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
+    #     f" {model.max_seq_length} and context length is {model.config.block_size}"
+    # )
+    longest_seq_ix = None
+    longest_seq_length = model.max_seq_length
+
+    throughput = ThroughputMonitor(fabric, window_size=5)
+
+    with torch.device("meta"):
+        meta_model = GPT(model.config)
+        x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
+        model_fwd = lambda: meta_model(x)
+        model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
+        measured_flops = measure_flops(meta_model, model_fwd, model_loss)
+        fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
+        del meta_model, x
+
+    running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+
 
     validate(fabric, model, val_data, tokenizer, max_iters=2)  # sanity check
 
@@ -188,7 +204,7 @@ def train(
     for iter_num in range(1, max_iters + 1):
         if step_count <= warmup_steps:
             # linear warmup
-            lr = learning_rate * step_count / warmup_steps
+            lr = get_lr(iter_num, max_iters)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -198,11 +214,14 @@ def train(
 
         is_accumulating = iter_num % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids, lm_head_chunk_size=128)
+            logits = model(input_ids) #, lm_head_chunk_size=128)
             # shift the targets such that output n predicts token n+1
-            logits[-1] = logits[-1][..., :-1, :]
+            # logits[-1] = logits[-1][..., :-1, :]
+            logits = logits[..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
+
+        running_loss.update(loss.detach())
 
         if not is_accumulating:
             optimizer.step()
@@ -213,16 +232,33 @@ def train(
 
         total_lengths += input_ids.numel()
         if iter_num % log_interval == 0:
-            loss_item = loss.item()  # expensive device-to-host synchronization
+            loss = running_loss.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
             throughput.update(
-                time=t1 - total_t0, batches=iter_num, samples=iter_num * micro_batch_size, lengths=total_lengths
+                time=(t1 - total_t0),
+                flops=(measured_flops * log_interval),
+                batches=iter_num,
+                samples=(iter_num * micro_batch_size),
+                lengths=(iter_num * micro_batch_size * model.config.block_size),
             )
-            throughput.compute_and_log(step=iter_num)
+            metrics = {
+                "loss": loss,
+                "iter": iter_num,
+                "step": step_count,
+                "iter_time": t1 - iter_t0,
+                "tokens": iter_num * micro_batch_size * model.config.block_size,
+                "total_tokens": iter_num * micro_batch_size * model.config.block_size * fabric.world_size,
+                "learning_rate": lr,
+            }
+
             fabric.print(
-                f"iter {iter_num} step {step_count}: loss {loss_item:.4f}, iter time:"
+                f"iter {iter_num} step {step_count}: loss {loss:.4f}, iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
+
+            throughput_metrics = throughput.compute()
+            metrics.update(throughput_metrics)
+            fabric.log_dict(metrics, step=iter_num)
 
         if not is_accumulating and step_count % eval_interval == 0:
             t0 = time.perf_counter()
@@ -312,6 +348,21 @@ def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
 def save_lora_checkpoint(fabric: L.Fabric, model: torch.nn.Module, file_path: Path) -> None:
     fabric.print(f"Saving LoRA weights to {str(file_path)!r}")
     fabric.save(file_path, {"model": model}, filter={"model": lora_filter})
+
+
+# learning rate decay scheduler (cosine with warmup)
+def get_lr(it: int, lr_decay_iters: int) -> int:
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > lr_decay_iters:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (learning_rate - min_lr)
 
 
 if __name__ == "__main__":

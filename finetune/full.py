@@ -36,7 +36,7 @@ save_interval = 1000
 eval_iters = 100
 eval_max_new_tokens = 100
 log_interval = 1
-devices = torch.cuda.device_count()
+devices = 2 # torch.cuda.device_count()
 
 # Hyperparameters
 learning_rate = 1e-5
@@ -55,8 +55,8 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 
 
 def setup(
-    data_dir: Path = Path("data/ultrachat"),
-    checkpoint_dir: Path = Path("/teamspace/s3_connections/tinyllama-checkpoints/export/step-00357500-3.0T"),
+    data_dir: Path = Path("data/ultrachat3"),
+    checkpoint_dir: Path = Path("checkpoints/lit-tiny-llama/lit-tiny-llama-3.0T"),
     out_dir: Path = Path("out/full/lit-tiny-llama-finetuned"),
 ) -> None:
 
@@ -72,7 +72,7 @@ def setup(
     else:
         strategy = "auto"
 
-    logger = WandbLogger(project="tinyllama", name="lit-tiny-llama-1.1b-finetune")
+    logger = WandbLogger(project="tinyllama-finetune", name="lit-tiny-llama-1.1b")
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision="bf16-true", loggers=logger)
     fabric.print(hparams)
     fabric.launch(main, data_dir, checkpoint_dir, out_dir)
@@ -87,8 +87,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
         os.makedirs(out_dir, exist_ok=True)
 
     fabric.print("Loading dataset ...")
-    train_data = torch.load(data_dir / "train.pt", mmap=True)
-    val_data = torch.load(data_dir / "test.pt", mmap=True)
+    train_data = torch.load(data_dir / "train.bin", mmap=True)
+    val_data = torch.load(data_dir / "test.bin", mmap=True)
 
     config = Config.from_name(name="tiny-llama-1.1b")
     checkpoint_path = checkpoint_dir / "lit_model.pth"
@@ -166,13 +166,16 @@ def train(
         input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 1 else None)
         # input_ids = input_ids[:, 1:]
         # targets = targets[:, 1:]
-        input_ids = train_data[:, 0 : model.config.block_size].contiguous().long()
-        targets = train_data[:, 1 : (model.config.block_size + 1)].contiguous().long()
+        input_ids = input_ids[:, :-1]
+        targets = targets[:, 1:]
 
         is_accumulating = iter_num % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+            # fabric.print("input", input_ids[0].tolist())
+            # fabric.print("target", targets[0].tolist())
+            loss = chunked_cross_entropy(logits, targets)
+            # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_iters)
 
         running_loss.update(loss.detach())

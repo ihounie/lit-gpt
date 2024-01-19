@@ -33,8 +33,8 @@ lora_head = False
 def main(
     prompt: str = "What food do llamas eat?",
     input: str = "",
-    lora_path: Path = Path("out/lora/alpaca/lit_model_lora_finetuned.pth"),
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
+    lora_path: Path = Path("out/lora/tiny-llama-ultrachat-tuned2/iter-422400-ckpt.pth"),
+    checkpoint_dir: Path = Path("checkpoints/lit-tiny-llama/lit-tiny-llama-3.0T"),
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
     max_new_tokens: int = 100,
     top_k: Optional[int] = 200,

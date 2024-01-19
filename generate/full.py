@@ -27,8 +27,8 @@ from scripts.prepare_alpaca import generate_prompt
 def main(
     prompt: str = "What food do llamas eat?",
     input: str = "",
-    finetuned_path: Path = Path("out/full/alpaca/lit_model_finetuned.pth"),
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
+    finetuned_path: Path = Path("out/full/lit-tiny-llama-finetuned/iter-002000-ckpt.pth"),
+    checkpoint_dir: Path = Path("checkpoints/lit-tiny-llama/lit-tiny-llama-3.0T"),
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
     max_new_tokens: int = 100,
     top_k: Optional[int] = 200,
@@ -106,7 +106,7 @@ def main(
     t = time.perf_counter() - t0
 
     output = tokenizer.decode(y)
-    output = output.split("### Response:")[1].strip()
+    output = output.split("### Response: ")[1].strip()
     fabric.print(output)
 
     tokens_generated = y.size(0) - prompt_length

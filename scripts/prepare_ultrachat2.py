@@ -9,6 +9,7 @@ from typing import Union, Optional
 
 import numpy as np
 from tqdm import tqdm
+import torch
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -19,7 +20,7 @@ from lit_gpt import Tokenizer
 
 def prepare(
     destination_path: Path = Path("data/ultrachat3"),
-    checkpoint_dir: Path = Path("/teamspace/s3_connections/tinyllama-checkpoints/export/step-00357500-3.0T"),
+    checkpoint_dir: Path = Path("checkpoints/lit-tiny-llama/lit-tiny-llama-3.0T"),
     dataset_name: str = "stingning/ultrachat",
     max_seq_length: int = 2048,
 ) -> None:
@@ -51,14 +52,13 @@ def prepare(
 
     # tokenize the dataset
     tokenized = split_dataset.map(process, remove_columns=["id", "data"], desc="tokenizing the splits", num_proc=(os.cpu_count() // 2))
-
+    tokenized.set_format("pt", output_all_columns=True)
 
     for split, dset in tokenized.items():
         filename = destination_path / f"{split}.bin"
         # dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
-        
-        all_data = [d for d in dset]
-        # print(all_data[0])
+        all_data = list(dset)
+        print(all_data[0])
         torch.save(all_data, filename)
 
     # concatenate all the ids in each dataset into one large file we can use for training
@@ -88,7 +88,7 @@ def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int) -> dict
     labels = encoded_full_prompt_and_response.clone()
     labels[:len(encoded_full_prompt)] = -1
 
-    return {**example, "input_ids": encoded_full_prompt_and_response.short(), "labels": labels.short()}
+    return {"input_ids": encoded_full_prompt_and_response.short(), "labels": labels.short()}
 
 
 def generate_prompt(example: dict) -> str:
