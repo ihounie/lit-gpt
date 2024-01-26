@@ -28,6 +28,7 @@ from lit_gpt.utils import (
 )
 from scripts.prepare_alpaca import generate_prompt
 
+import wandb
 eval_interval = 100
 save_interval = 100
 eval_iters = 100
@@ -43,18 +44,23 @@ batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000  # train dataset size
+max_iters = 5000  # train dataset size
 weight_decay = 0.01
-lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 lora_query = True
-lora_key = False
+lora_key = True
 lora_value = True
-lora_projection = False
+lora_projection = True
 lora_mlp = False
 lora_head = False
 warmup_steps = 100
+tensor_lora = False
+joint_heads = True
+joint_layers = True
+joint_qk_vp = False
+joint_qkvp = True
+#stochastic_layer_threshold = 0.5
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
@@ -64,7 +70,16 @@ def setup(
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
     out_dir: Path = Path("out/lora/alpaca"),
     precision: Optional[str] = None,
+    rank: int = 8,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq"]] = None,
+    learning_rate: float = 3e-4,
+    alpha: int = 16,
+    tensor_lora: bool = False,
+    joint_heads: bool = True,
+    joint_layers: bool = True,
+    joint_qk_vp: bool = False,
+    joint_qkvp: bool = True,
+    #stochastic_layer_threshold: float = 0.5,
 ):
     precision = precision or get_default_supported_precision(training=True)
 
@@ -83,14 +98,21 @@ def setup(
         )
     else:
         strategy = "auto"
-
+    hparams["lora_r"] = rank
+    hparams["lora_alpha"] = alpha
+    hparams["learning_rate"] = learning_rate
+    #hparams["stochastic_layer_threshold"] = stochastic_layer_threshold
+    hparams["tensor_lora"] = tensor_lora
+    hparams["joint_heads"] = joint_heads
+    hparams["joint_layers"] = joint_layers
+    hparams["joint_qk_vp"] = joint_qk_vp
+    hparams["joint_qkvp"] = joint_qkvp
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
-    fabric.launch(main, data_dir, checkpoint_dir, out_dir, quantize)
+    fabric.launch(main, data_dir, checkpoint_dir, out_dir, quantize, rank)
 
-
-def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, quantize: Optional[str] = None):
+def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, quantize: Optional[str] = None, lora_r: int = 8):
     check_valid_checkpoint_dir(checkpoint_dir)
 
     speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
@@ -116,7 +138,25 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         to_projection=lora_projection,
         to_mlp=lora_mlp,
         to_head=lora_head,
+        tensor_lora=tensor_lora,
+        joint_heads=joint_heads,
+        joint_layers=joint_layers,
+        joint_qk_vp=joint_qk_vp,
+        joint_qkvp=joint_qkvp,
+        #stochastic_layer_threshold=stochastic_layer_threshold,
     )
+    name = f"lora_r_{config.r}"
+    if config.tensor_lora:
+        name = "tensor_" + name
+        if config.joint_heads:
+            name+="_joint_heads"
+        if config.joint_layers:
+            name+="_joint_layers"
+        if config.joint_qk_vp:
+            name+="_joint_qk_vp"
+        if config.joint_qkvp:
+            name+="_joint_qkvp"
+    wandb.init(config=hparams, project="lora", name=name)
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
     with fabric.init_module(empty_init=False), quantization(quantize):
@@ -148,7 +188,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
     # Save the final LoRA checkpoint at the end of training
-    save_path = out_dir / "lit_model_lora_finetuned.pth"
+    save_path = out_dir / f"{name}_lora_finetuned.pth"
     save_lora_checkpoint(fabric, model, save_path)
 
 
@@ -193,6 +233,7 @@ def train(
             lr = learning_rate * step_count / warmup_steps
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
+        model.config.stochastic_layer_threshold = iter_num / max_iters
 
         iter_t0 = time.perf_counter()
 
@@ -228,6 +269,7 @@ def train(
                 f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
+            wandb.log({"loss": loss.item()}, step=step_count)
 
         if not is_accumulating and step_count % eval_interval == 0:
             t0 = time.perf_counter()
@@ -236,6 +278,7 @@ def train(
             speed_monitor.eval_end(t1)
             fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
+            wandb.log({"val_loss": val_loss.item()}, step=step_count)
         if not is_accumulating and step_count % save_interval == 0:
             checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
             save_lora_checkpoint(fabric, model, checkpoint_path)

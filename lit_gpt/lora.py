@@ -57,6 +57,7 @@ from lit_gpt.model import Block as BaseBlock
 from lit_gpt.model import CausalSelfAttention as BaseCausalSelfAttention
 from lit_gpt.model import KVCache
 from lit_gpt.utils import map_old_state_dict_weights
+from lit_gpt.model import apply_rope
 
 
 class LoRALayer(nn.Module):
@@ -120,10 +121,11 @@ class LoRALinear(LoRALayer):
 
         # Actual trainable parameters
         if r > 0:
-            self.lora_A = nn.Parameter(self.linear.weight.new_zeros((r, in_features)))
-            self.lora_B = nn.Parameter(self.linear.weight.new_zeros((out_features, r)))
+            # TODO (ihounie): check that omitting this does not affect the behaviour of og LORA
+            #self.lora_A = nn.Parameter(self.linear.weight.new_zeros((r, in_features)))
+            #self.lora_B = nn.Parameter(self.linear.weight.new_zeros((out_features, r)))
             self.scaling = self.lora_alpha / self.r
-            self.reset_parameters()
+            #self.reset_parameters()
 
     def reset_parameters(self):
         """Reset all the weights, even including pretrained ones."""
@@ -135,19 +137,22 @@ class LoRALinear(LoRALayer):
 
     def merge(self):
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
+        # TODO (ihounie): implement weight merging
+        raise NotImplementedError("(ihounie) weight merging not implemented")
         if self.r > 0 and not self.merged:
             # Merge the weights and mark it
             self.linear.weight.data += (self.lora_B @ self.lora_A) * self.scaling
             self.merged = True
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, dW: Optional[torch.Tensor] = None) -> torch.Tensor:
         # if weights are merged or rank is less or equal to zero (LoRA is disabled) - it's only a regular nn.Linear forward pass;
         # otherwise in addition do the forward pass with LoRA weights and add it's output to the output from pretrained weights
         pretrained = self.linear(x)
         if self.r == 0 or self.merged:
             return pretrained
-        lora = (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
-        return pretrained + lora
+        else:
+            lora = (self.lora_dropout(x) @ dW) * self.scaling
+            return pretrained + lora
 
 
 class LoRAQKVLinear(LoRALinear):
@@ -205,7 +210,7 @@ class LoRAQKVLinear(LoRALinear):
         # ⚬ r: 2
         # ⚬ enable_lora: [True, False, True]
         if r > 0 and any(enable_lora):
-            self.lora_A = nn.Parameter(self.linear.weight.new_zeros((r * sum(enable_lora), in_features)))  # (4, 128)
+            #self.lora_A = nn.Parameter(self.linear.weight.new_zeros((r * sum(enable_lora), in_features)))  # (4, 128)
             enable_q, enable_k, enable_v = enable_lora
             self.kv_embd_size = self.linear.in_features // (n_head // n_query_groups)
             # qkv_shapes will be used to split a tensor with weights correctly
@@ -215,7 +220,7 @@ class LoRAQKVLinear(LoRALinear):
                 self.kv_embd_size * enable_v,
             )
             self.qkv_shapes = [s for s in qkv_shapes if s]
-            self.lora_B = nn.Parameter(self.linear.weight.new_zeros(sum(self.qkv_shapes), r))  # (256, 2))
+            #self.lora_B = nn.Parameter(self.linear.weight.new_zeros(sum(self.qkv_shapes), r))  # (256, 2))
             # Notes about shapes above
             # - self.lora_A has shape (4, 128): 4 because rank is 2 and LoRA is applied only to two matrices;
             # 128 is the input size of the x (embedding size). (4, 128) and not (128, 4) because later on in
@@ -337,6 +342,8 @@ class LoRAQKVLinear(LoRALinear):
         # ⚬ self.linear.weight.data: (384, 128) or (3 * embedding_size, embedding_size)
         # ⚬ self.lora_A.data: (4, 128)
         # ⚬ self.lora_B.data: (256, 2)
+        # TODO (ihounie): implement weight merging
+        raise NotImplementedError("(ihounie) weight merging not implemented")
         if self.r > 0 and any(self.enable_lora) and not self.merged:
             delta_w = self.conv1d(
                 self.lora_A.data.unsqueeze(0),  # (4, 128) -> (1, 4, 128)
@@ -348,7 +355,7 @@ class LoRAQKVLinear(LoRALinear):
             self.linear.weight.data += self.zero_pad(delta_w * self.scaling)  # (256, 128) after zero_pad (384, 128)
             self.merged = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, dQ: torch.Tensor=None, dK:torch.Tensor=None, dV: torch.Tensor=None) -> torch.Tensor:
         """Do the forward pass.
 
         If LoRA's weights are merged with pretrained ones then it's a simple matrix multiplication.
@@ -360,30 +367,25 @@ class LoRAQKVLinear(LoRALinear):
         Returns:
             Output tensor of shape (batch_size, context_length, 3 * embedding_size)
         """
+        # TODO (ihounie): cleanup coments
 
-        # Let's assume that:
+        # Let's assume that: 
         # ⚬ x: (64, 64, 128) or (batch_size, context_length, embedding_size)
         # ⚬ self.linear.weight: (384, 128) or (3 * embedding_size, embedding_size)
         # ⚬ self.lora_A.data: (4, 128)
         # ⚬ self.lora_B.data: (256, 2)
-
         # if weights are merged or LoRA is disabled (r <= 0 or all `enable_lora` are False) - it's only a regular nn.Linear forward pass;
         # otherwise in addition do the forward pass with LoRA weights and add it's output to the output from pretrained weights
+        #print("x", x.shape)
         pretrained = self.linear(x)
-        if self.r == 0 or not any(self.enable_lora) or self.merged:
+        #print("pretrained", pretrained.shape)
+        if dQ is not None and dK is not None and dV is not None:
+            # TODO (ihounie): implement this as a single multiplication
+            x_d = self.lora_dropout(x)
+            lora = torch.concatenate((x_d@dQ, x_d@dK, x_d@dV), 2) * self.scaling
+            return pretrained + lora
+        else:
             return pretrained
-        after_A = F.linear(self.lora_dropout(x), self.lora_A)  # (64, 64, 128) @ (4, 128) -> (64, 64, 4)
-        # For F.conv1d:
-        # ⚬ input: input tensor of shape (mini-batch, in_channels, iW)
-        # ⚬ weight: filters of shape (out_channels, in_channels/groups, kW)
-        after_B = self.conv1d(
-            after_A.transpose(-2, -1),  # (64, 64, 4) -> (64, 4, 64)
-            self.lora_B.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
-        ).transpose(
-            -2, -1
-        )  # (64, 4, 64) @ (256, 2, 1) -> (64, 256, 64) -> (64, 64, 256)
-        lora = self.zero_pad(after_B) * self.scaling  # (64, 64, 256) after zero_pad (64, 64, 384)
-        return pretrained + lora
 
 
 def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
@@ -427,6 +429,11 @@ def lora_filter(key: str, value: Any) -> bool:
 class Config(BaseConfig):
     """
     Args:
+        tensor_lora: whether to use LoRA for tensors or the OG matrix version
+        joint_heads: when using tensor lora, whether to jointly parametrize heads
+        joint_layers: when using tensor lora, whether to jointly parametrize layers
+        joint_qk_vp: when using tensor lora, whether to jointly parametrize q/k and v/p matrices
+        joint_qkvp: when using tensor lora, whether to jointly parametrize q/k/v/p matrices
         r: rank of the weight update matrices. To make sense of using LoRA the rank should be smaller than the rank of
             the weights of the model. The rank can be as low as 1: https://arxiv.org/pdf/2106.09685.pdf (section 7.2)
         alpha: alpha is needed for scaling updates as alpha/r
@@ -445,6 +452,11 @@ class Config(BaseConfig):
     to_projection: bool = False
     to_mlp: bool = False
     to_head: bool = False
+    tensor_lora: bool = False
+    joint_heads: bool = True
+    joint_layers: bool = True
+    joint_qk_vp: bool = False
+    joint_qkvp: bool = False
 
     @property
     def mlp_class(self) -> Type:
@@ -474,6 +486,51 @@ class GPT(BaseModel):
         )
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
+        if not config.tensor_lora:
+            print("Using original matrix low rank adapters")
+            # original matrix low rank adapters
+            # fine tuning all of Q, K, V, P
+            self.lora_A = nn.Parameter(torch.empty((config.n_layer, 4, config.n_embd, config.r)))
+            self.lora_B = nn.Parameter(torch.zeros((config.n_layer, 4, config.r, config.n_embd)))
+            print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
+            for layer in range(config.n_layer):
+                nn.init.kaiming_uniform_(self.lora_A[layer], a=math.sqrt(5))
+        else:
+            head_dim = config.n_embd // config.n_head
+            if config.joint_heads:
+                self.lora_C_h = nn.Parameter(torch.zeros(config.n_head, config.r))
+                A_shape = (config.n_embd, config.r)
+                B_shape = (config.r, head_dim)
+            else:
+                head_dim = config.n_embd
+                A_shape = (config.n_embd, config.r)
+                B_shape = (config.n_heads, config.r, head_dim)
+            if config.joint_qkvp:
+                self.lora_C_m = nn.Parameter(torch.zeros(4, config.r))
+            else:
+                A_shape = (4, ) + A_shape
+                B_shape = (4, ) + B_shape 
+            if config.joint_layers:
+                self.lora_C_l = nn.Parameter(torch.zeros(config.n_layer, config.r))
+            else:
+                A_shape = (config.n_layer, ) + A_shape
+                B_shape = (config.n_layer, ) + B_shape
+            if config.joint_qk_vp:
+                raise NotImplementedError("joint_qk_vp not implemented")
+
+            self.lora_A = nn.Parameter(torch.empty(A_shape))
+            self.lora_B = nn.Parameter(torch.zeros(B_shape))
+            if len(A_shape) == 2:
+                nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            elif len(A_shape) == 3:
+                for i in range(A_shape[0]):
+                    nn.init.kaiming_uniform_(self.lora_A[i], a=math.sqrt(5))
+            elif len(A_shape) == 4:
+                for i in range(A_shape[0]):
+                    for j in range(A_shape[1]):
+                        nn.init.kaiming_uniform_(self.lora_A[i, j], a=math.sqrt(5))
+            print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
+
 
     def forward(
         self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
@@ -494,8 +551,25 @@ class GPT(BaseModel):
             mask = None
 
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
+        # (ihounie) compute adapter weights for each layer on the fly
+        for block_idx, block in enumerate(self.transformer.h):
+            if not self.config.tensor_lora:
+                dQ = self.lora_A[block_idx, 0] @ self.lora_B[block_idx, 0]
+                dK = self.lora_A[block_idx, 1] @ self.lora_B[block_idx, 1]
+                dV = self.lora_A[block_idx, 2] @ self.lora_B[block_idx, 2]
+                dP = self.lora_A[block_idx, 3] @ self.lora_B[block_idx, 3]
+                #print(dQ.shape, dK.shape, dV.shape, dP.shape)
+            else:
+                if self.config.joint_layers and self.joint_heads and self.joint_qkvp:
+                    dQ = torch.cat([self.lora_A@torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[0]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1)
+                    assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
+                    dK = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[1]*self.lora_C_l[block_idx])@ self.lora_B for head_idx in range(self.config.n_head)], dim=1)
+                    dV = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[2]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1) 
+                    dP = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[3]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1)
+                else:
+                    raise NotImplementedError("only for joint layers, qkvp and heads")
+
+            x = block(x, cos, sin, mask, input_pos, dQ, dK, dV, dP)
         x = self.transformer.ln_f(x)
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
@@ -529,7 +603,32 @@ class Block(BaseBlock):
         self.mlp = config.mlp_class(config)
 
         self.config = config
-
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        dQ: Optional[torch.Tensor] = None,
+        dK: Optional[torch.Tensor] = None,
+        dV: Optional[torch.Tensor] = None,
+        dP: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        n_1 = self.norm_1(x)
+        h = self.attn(n_1, cos, sin, mask, input_pos, dQ, dK, dV, dP)
+        if self.config.parallel_residual:
+            n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
+            x = x + h + self.mlp(n_2)
+        else:
+            if self.config.shared_attention_norm:
+                raise NotImplementedError(
+                    "No checkpoint amongst the ones we support uses this configuration"
+                    " (non-parallel residual and shared attention norm)."
+                )
+            x = x + h
+            x = x + self.mlp(self.norm_2(x))
+        return x
 
 class CausalSelfAttention(BaseCausalSelfAttention):
     def __init__(self, config: Config) -> None:
@@ -574,6 +673,58 @@ class CausalSelfAttention(BaseCausalSelfAttention):
         }
         state_dict = map_old_state_dict_weights(state_dict, mapping, prefix)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        dQ: Optional[torch.Tensor] = None,
+        dK: Optional[torch.Tensor] = None,
+        dV: Optional[torch.Tensor] = None,
+        dP: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        qkv = self.attn(x, dQ, dK, dV)
+
+        # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
+        q_per_kv = self.config.n_head // self.config.n_query_groups
+        total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
+        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)
+        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
+
+        # split batched computation into three
+        q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
+
+        # repeat k and v if necessary
+        if self.config.n_query_groups != 1:  # doing this would require a full kv cache with MQA (inefficient!)
+            # for MHA this is a no-op
+            k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+            v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+
+        q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
+        k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
+        v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
+
+        q_roped = apply_rope(q[..., : self.config.rope_n_elem], cos, sin)
+        k_roped = apply_rope(k[..., : self.config.rope_n_elem], cos, sin)
+        q = torch.cat((q_roped, q[..., self.config.rope_n_elem :]), dim=-1)
+        k = torch.cat((k_roped, k[..., self.config.rope_n_elem :]), dim=-1)
+
+        if input_pos is not None:
+            if not isinstance(self.kv_cache, KVCache):
+                raise TypeError("You need to call `gpt.set_kv_cache()`")
+            k, v = self.kv_cache(input_pos, k, v)
+
+        y = self.scaled_dot_product_attention(q, k, v, mask)
+
+        y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
+
+        # output projection
+        return self.proj(y, dP)
 
 
 class GptNeoxMLP(lit_gpt.model.GptNeoxMLP):
@@ -654,4 +805,6 @@ def merge_lora_weights(model: GPT) -> None:
     """Merge LoRA weights into the full-rank weights to speed up inference."""
     for module in model.modules():
         if isinstance(module, LoRALinear):
+            # TODO (ihounie): implement weight merging
+            raise NotImplementedError("(ihounie) weight merging not implemented")
             module.merge()
