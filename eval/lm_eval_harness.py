@@ -7,8 +7,8 @@ from typing import List, Literal, Optional
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
-from lm_eval import base, evaluator, tasks
-from lm_eval.base import BaseLM
+from lm_eval import evaluator, tasks
+from lm_eval.base import BaseLM, CachingLM
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -25,7 +25,8 @@ class EvalHarnessBase(BaseLM):
     # https://github.com/EleutherAI/gpt-neox/blob/main/eval_tasks/eval_adapter.py
     def __init__(
         self,
-        checkpoint_dir: str = "",
+        checkpoint_dir: str = "checkpoints/stabilityai/stablelm-base-alpha-3b",
+        model_file: str = "lit_model.pth",
         precision: str = "bf16-true",
         batch_size=1,
         temperature=1.0,
@@ -53,12 +54,13 @@ class EvalHarnessBase(BaseLM):
 
         if quantize is not None and devices > 1:
             raise NotImplementedError
-        if quantize == "gptq.int4":
-            model_file = "lit_model_gptq.4bit.pth"
-            if not (checkpoint_dir / model_file).is_file():
-                raise ValueError("Please run `python quantize/gptq.py` first")
-        else:
-            model_file = "lit_model.pth"
+        if model_file =="":
+            if quantize == "gptq.int4":
+                model_file = "lit_model_gptq.4bit.pth"
+                if not (checkpoint_dir / model_file).is_file():
+                    raise ValueError("Please run `python quantize/gptq.py` first")
+            else:
+                model_file = "lit_model.pth"
         checkpoint_path = checkpoint_dir / model_file
 
         fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
@@ -141,7 +143,7 @@ class EvalHarnessBase(BaseLM):
         limit=None,
     ):
         if eval_tasks is None:
-            eval_tasks = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"]
+            eval_tasks = ["hendrycksTest-*"] #["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"]
 
         # Returns a list containing all values of the task registry that
         # match at least one of the patterns
@@ -156,6 +158,9 @@ class EvalHarnessBase(BaseLM):
 
         eval_tasks = pattern_match(eval_tasks, tasks.ALL_TASKS)
         print(f"Found tasks: {eval_tasks}")
+        # make mmlu five shot and the rest 0 shot
+        zero_shot_tasks = [t for t in eval_tasks if "hendrycks" not in t]
+        five_shot_tasks = [t for t in eval_tasks if "hendrycks" in t]
 
         # **HACK INCOMING**:
         # first get task dict on local main rank
@@ -171,18 +176,36 @@ class EvalHarnessBase(BaseLM):
         if use_cache:
             lm = base.CachingLM(lm, "lm_cache/" + name + ".db")
 
-        results = evaluator.evaluate(
-            lm=lm,
-            task_dict=tasks.get_task_dict(eval_tasks),
-            description_dict=description_dict,
-            num_fewshot=num_fewshot,
-            limit=limit,
-            bootstrap_iters=bootstrap_iters,
-        )
+        if len(zero_shot_tasks):
+            print(f"running zero shot on {zero_shot_tasks}")
+            results_0 = evaluator.evaluate(
+                lm=lm,
+                task_dict=tasks.get_task_dict(zero_shot_tasks),
+                description_dict=description_dict,
+                num_fewshot=0,
+                limit=limit,
+                bootstrap_iters=bootstrap_iters,
+            )
+        else:
+            results_0 = {}
+
+        if len(five_shot_tasks):
+            print(f"running five shot on {five_shot_tasks}")
+            results_5 = evaluator.evaluate(
+                lm=lm,
+                task_dict=tasks.get_task_dict(five_shot_tasks),
+                description_dict=description_dict,
+                num_fewshot=5,
+                limit=limit,
+                bootstrap_iters=bootstrap_iters,
+            )
+        else:
+            results_5 = {}
+        
+        results = {**results_0, **results_5}
 
         results["config"] = {
             "model": self.model.config.name,
-            "num_fewshot": num_fewshot,
             "batch_size": self.batch_size,
             "device": str(self.device),
             "no_cache": not use_cache,

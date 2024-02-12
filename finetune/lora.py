@@ -28,6 +28,8 @@ from lit_gpt.utils import (
 )
 from scripts.prepare_alpaca import generate_prompt
 
+from eval.lm_eval_harness import EvalHarnessBase
+
 import wandb
 eval_interval = 100
 save_interval = 100
@@ -61,6 +63,9 @@ joint_layers = True
 joint_qk_vp = False
 joint_qkvp = True
 #stochastic_layer_threshold = 0.5
+# evaluation
+eval_tasks= ["arc_challenge", "piqa", "hellaswag", "winogrande"]
+num_fewshot=0
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
@@ -79,6 +84,8 @@ def setup(
     joint_layers: bool = True,
     joint_qk_vp: bool = False,
     joint_qkvp: bool = True,
+    eval_tasks: Optional[List[str]] = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"],
+    num_fewshot: int = 0,
     #stochastic_layer_threshold: float = 0.5,
 ):
     precision = precision or get_default_supported_precision(training=True)
@@ -107,6 +114,8 @@ def setup(
     hparams["joint_layers"] = joint_layers
     hparams["joint_qk_vp"] = joint_qk_vp
     hparams["joint_qkvp"] = joint_qkvp
+    hparams["eval_tasks"] = eval_tasks
+    hparams["num_fewshot"] = num_fewshot
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
@@ -182,14 +191,30 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.seed_everything(1337 + fabric.global_rank)
 
     train_time = time.perf_counter()
-    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
+    #train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
     # Save the final LoRA checkpoint at the end of training
-    save_path = out_dir / f"{name}_lora_finetuned.pth"
+    save_path = checkpoint_dir / f"{name}_lora_finetuned.pth"
     save_lora_checkpoint(fabric, model, save_path)
+
+    eval_harness = EvalHarnessBase(
+        checkpoint_dir=str(checkpoint_dir),
+        model_file=f"{name}_lora_finetuned.pth",
+        quantize=quantize,
+    )
+
+    results = eval_harness.run_eval(
+        eval_tasks="mmlu", num_fewshot=5, use_cache=False
+    )
+    wandb.log(results)
+
+    results = eval_harness.run_eval(
+        eval_tasks=eval_tasks, num_fewshot=num_fewshot, use_cache=False
+    )
+    wandb.log(results)
 
 
 def train(

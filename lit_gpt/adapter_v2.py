@@ -192,4 +192,6 @@ class LLaMAMLP(lit_gpt.model.LLaMAMLP):
 def mark_only_adapter_v2_as_trainable(model: GPT) -> None:
     """Sets requires_grad=False for all non-adapter weights"""
     for name, param in model.named_parameters():
+        print(name)
         param.requires_grad = adapter_filter(name, param)
+    assert(0)
