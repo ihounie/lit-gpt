@@ -135,13 +135,16 @@ class LoRALinear(LoRALayer):
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B)
 
-    def merge(self):
+    def merge(self, dW: torch.Tensor=None):
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
-        # TODO (ihounie): implement weight merging
-        raise NotImplementedError("(ihounie) weight merging not implemented")
+        # TODO (ihounie): test weight merging
+        #raise NotImplementedError("(ihounie) weight merging not implemented")
         if self.r > 0 and not self.merged:
-            # Merge the weights and mark it
-            self.linear.weight.data += (self.lora_B @ self.lora_A) * self.scaling
+            if dW is None:
+                # Merge the weights and mark it
+                self.linear.weight.data += (self.lora_B @ self.lora_A) * self.scaling
+            else:
+                self.linear.weight.data += dW * self.scaling
             self.merged = True
 
     def forward(self, x: torch.Tensor, dW: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -335,25 +338,32 @@ class LoRAQKVLinear(LoRALinear):
             [F.conv1d(a, b) for a, b in zip(input_splitted, weight_splitted)], dim=1  # (B, C_output', T)
         )  # (B, C_output, T)
 
-    def merge(self):
+    def merge(self, dQ: torch.Tensor=None, dK: torch.Tensor=None, dV: torch.Tensor=None):
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
 
         # Let's assume that:
         # ⚬ self.linear.weight.data: (384, 128) or (3 * embedding_size, embedding_size)
         # ⚬ self.lora_A.data: (4, 128)
         # ⚬ self.lora_B.data: (256, 2)
-        # TODO (ihounie): implement weight merging
-        raise NotImplementedError("(ihounie) weight merging not implemented")
+        # TODO (ihounie): test weight merging
+        #raise NotImplementedError("(ihounie) weight merging not implemented")
         if self.r > 0 and any(self.enable_lora) and not self.merged:
-            delta_w = self.conv1d(
-                self.lora_A.data.unsqueeze(0),  # (4, 128) -> (1, 4, 128)
-                self.lora_B.data.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
-            ).squeeze(
-                0
-            )  # (1, 4, 128) @ (256, 2, 1) -> (1, 256, 128) -> (256, 128)
-            # W = W + delta_W (merge)
-            self.linear.weight.data += self.zero_pad(delta_w * self.scaling)  # (256, 128) after zero_pad (384, 128)
-            self.merged = True
+            if dQ is None and dK is None and dV is None:
+                delta_w = self.conv1d(
+                    self.lora_A.data.unsqueeze(0),  # (4, 128) -> (1, 4, 128)
+                    self.lora_B.data.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
+                ).squeeze(
+                    0
+                )  # (1, 4, 128) @ (256, 2, 1) -> (1, 256, 128) -> (256, 128)
+                # W = W + delta_W (merge)
+                self.linear.weight.data += self.zero_pad(delta_w * self.scaling)  # (256, 128) after zero_pad (384, 128)
+                self.merged = True
+            elif dQ is not None and dK is not None and dV is not None:
+                delta_w = torch.concatenate((dQ, dK, dV),  1)
+                self.linear.weight.data += delta_w * self.scaling  # (256, 128) after zero_pad (384, 128)
+                self.merged = True
+            else:
+                raise NotImplementedError("all dQ, dK, dV have to be passed, padding not implemented")
 
     def forward(self, x: torch.Tensor, dQ: torch.Tensor=None, dK:torch.Tensor=None, dV: torch.Tensor=None) -> torch.Tensor:
         """Do the forward pass.
@@ -452,11 +462,12 @@ class Config(BaseConfig):
     to_projection: bool = False
     to_mlp: bool = False
     to_head: bool = False
-    tensor_lora: bool = False
+    tensor_lora: bool = True
     joint_heads: bool = True
     joint_layers: bool = True
     joint_qk_vp: bool = False
     joint_qkvp: bool = False
+    init_scale: float = 1.0
 
     @property
     def mlp_class(self) -> Type:
@@ -492,31 +503,38 @@ class GPT(BaseModel):
             # fine tuning all of Q, K, V, P
             self.lora_A = nn.Parameter(torch.empty((config.n_layer, 4, config.n_embd, config.r)))
             self.lora_B = nn.Parameter(torch.zeros((config.n_layer, 4, config.r, config.n_embd)))
-            print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
+            #print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
             for layer in range(config.n_layer):
-                nn.init.kaiming_uniform_(self.lora_A[layer], a=math.sqrt(5))
+                nn.init.kaiming_uniform_(self.lora_A[layer], a=math.sqrt(5)*config.init_scale)
         else:
             head_dim = config.n_embd // config.n_head
             if config.joint_heads:
-                self.lora_C_h = nn.Parameter(torch.zeros(config.n_head, config.r))
                 A_shape = (config.n_embd, config.r)
                 B_shape = (config.r, head_dim)
             else:
                 head_dim = config.n_embd
                 A_shape = (config.n_embd, config.r)
                 B_shape = (config.n_heads, config.r, head_dim)
-            if config.joint_qkvp:
-                self.lora_C_m = nn.Parameter(torch.zeros(4, config.r))
-            else:
+            C_shape = (config.r, )
+            if not config.joint_qkvp:
                 A_shape = (4, ) + A_shape
                 B_shape = (4, ) + B_shape 
+                C_shape = (4, ) + C_shape
             if config.joint_layers:
-                self.lora_C_l = nn.Parameter(torch.zeros(config.n_layer, config.r))
+                self.lora_C_l = nn.Parameter(torch.zeros((config.n_layer,)+ C_shape))
+                nn.init.kaiming_uniform_(self.lora_C_l, a=math.sqrt(5)*config.init_scale)
             else:
                 A_shape = (config.n_layer, ) + A_shape
                 B_shape = (config.n_layer, ) + B_shape
+                C_shape = (config.n_layer, ) + C_shape
             if config.joint_qk_vp:
                 raise NotImplementedError("joint_qk_vp not implemented")
+            if config.joint_heads:
+                self.lora_C_h = nn.Parameter(torch.zeros((config.n_head,) + C_shape))
+                nn.init.kaiming_uniform_(self.lora_C_h, a=math.sqrt(5)*config.init_scale)
+            if self.config.joint_qkvp:
+                self.lora_C_m = nn.Parameter(torch.zeros((4,)+ C_shape))
+                nn.init.kaiming_uniform_(self.lora_C_m, a=math.sqrt(5)*config.init_scale)
 
             self.lora_A = nn.Parameter(torch.empty(A_shape))
             self.lora_B = nn.Parameter(torch.zeros(B_shape))
@@ -529,8 +547,7 @@ class GPT(BaseModel):
                 for i in range(A_shape[0]):
                     for j in range(A_shape[1]):
                         nn.init.kaiming_uniform_(self.lora_A[i, j], a=math.sqrt(5))
-            print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
-
+            #print(f"lora_A: {self.lora_A.shape}, lora_B: {self.lora_B.shape}")
 
     def forward(
         self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
@@ -558,17 +575,41 @@ class GPT(BaseModel):
                 dK = self.lora_A[block_idx, 1] @ self.lora_B[block_idx, 1]
                 dV = self.lora_A[block_idx, 2] @ self.lora_B[block_idx, 2]
                 dP = self.lora_A[block_idx, 3] @ self.lora_B[block_idx, 3]
+                #print(f"sum of B is {torch.sum(self.lora_B[block_idx, 0])}")
                 #print(dQ.shape, dK.shape, dV.shape, dP.shape)
             else:
-                if self.config.joint_layers and self.joint_heads and self.joint_qkvp:
+                if self.config.joint_layers and self.config.joint_heads and self.config.joint_qkvp:
                     dQ = torch.cat([self.lora_A@torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[0]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1)
                     assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
                     dK = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[1]*self.lora_C_l[block_idx])@ self.lora_B for head_idx in range(self.config.n_head)], dim=1)
                     dV = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[2]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1) 
                     dP = torch.cat([self.lora_A @torch.diag(self.lora_C_h[head_idx]*self.lora_C_m[3]*self.lora_C_l[block_idx])@self.lora_B for head_idx in range(self.config.n_head)], dim=1)
+                    #if torch.sum(torch.abs(self.lora_B))>0:
+                    #print(f"sum of B: {torch.sum(self.lora_B)}")
+                    #print(f"sum of C_m: {torch.sum(self.lora_C_m)}, sum of C_h: {torch.sum(self.lora_C_h)}, sum of C_l: {torch.sum(self.lora_C_l)}")
+                    #assert(self.lora_C_m.requires_grad == True)
+                    #assert(self.lora_C_h.requires_grad == True)
+                    #assert(self.lora_C_l.requires_grad == True)
+                    #assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
+                    #assert(dK.shape == (self.config.n_embd, self.config.n_embd))
+                    #assert(dV.shape == (self.config.n_embd, self.config.n_embd))
+                    #assert(dP.shape == (self.config.n_embd, self.config.n_embd))
+                elif (not self.config.joint_layers) and self.config.joint_heads and self.config.joint_qkvp:
+                    #print(f"shapes A {self.lora_A.shape}, B {self.lora_B.shape}, C_h {self.lora_C_h.shape}, C_m {self.lora_C_m.shape}")
+                    dQ = torch.cat([self.lora_A[block_idx] @ torch.diag(self.lora_C_h[head_idx,block_idx]*self.lora_C_m[0, block_idx])@ self.lora_B[block_idx] for head_idx in range(self.config.n_head)], dim=1)
+                    assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
+                    dK = torch.cat([self.lora_A[block_idx] @ torch.diag(self.lora_C_h[head_idx,block_idx]*self.lora_C_m[1, block_idx])@ self.lora_B[block_idx] for head_idx in range(self.config.n_head)], dim=1)
+                    dV = torch.cat([self.lora_A[block_idx] @ torch.diag(self.lora_C_h[head_idx,block_idx]*self.lora_C_m[2, block_idx])@ self.lora_B[block_idx] for head_idx in range(self.config.n_head)], dim=1) 
+                    dP = torch.cat([self.lora_A[block_idx] @ torch.diag(self.lora_C_h[head_idx,block_idx]*self.lora_C_m[3, block_idx])@ self.lora_B[block_idx] for head_idx in range(self.config.n_head)], dim=1)
+                elif self.config.joint_layers and self.config.joint_heads and (not self.config.joint_qkvp):
+                    #print(f"shapes A {self.lora_A.shape}, B {self.lora_B.shape}, C_h {self.lora_C_h.shape}, C_l {self.lora_C_l.shape}")
+                    dQ = torch.cat([self.lora_A[0]@torch.diag(self.lora_C_h[head_idx, 0]*self.lora_C_l[block_idx, 0])@self.lora_B[0] for head_idx in range(self.config.n_head)], dim=1)
+                    assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
+                    dK = torch.cat([self.lora_A[1] @torch.diag(self.lora_C_h[head_idx, 1]+self.lora_C_l[block_idx, 1])@ self.lora_B[1] for head_idx in range(self.config.n_head)], dim=1)
+                    dV = torch.cat([self.lora_A[2] @torch.diag(self.lora_C_h[head_idx, 2]+self.lora_C_l[block_idx, 2])@self.lora_B[2] for head_idx in range(self.config.n_head)], dim=1) 
+                    dP = torch.cat([self.lora_A[3] @torch.diag(self.lora_C_h[head_idx, 3]+self.lora_C_l[block_idx, 3])@self.lora_B[3] for head_idx in range(self.config.n_head)], dim=1)
                 else:
-                    raise NotImplementedError("only for joint layers, qkvp and heads")
-
+                    raise NotImplementedError("Implemented joint heads and either joint qkvp or joint layers or the three of them at the same time. All other combinations are not implemented yet.")
             x = block(x, cos, sin, mask, input_pos, dQ, dK, dV, dP)
         x = self.transformer.ln_f(x)
         if lm_head_chunk_size > 0:
@@ -804,7 +845,30 @@ class LLaMAMLP(lit_gpt.model.LLaMAMLP):
 def merge_lora_weights(model: GPT) -> None:
     """Merge LoRA weights into the full-rank weights to speed up inference."""
     for module in model.modules():
-        if isinstance(module, LoRALinear):
-            # TODO (ihounie): implement weight merging
-            raise NotImplementedError("(ihounie) weight merging not implemented")
-            module.merge()
+        for block_idx, block in enumerate(model.transformer.h):
+            if not model.config.tensor_lora:
+                dQ = model.lora_A[block_idx, 0] @ model.lora_B[block_idx, 0]
+                dK = model.lora_A[block_idx, 1] @ model.lora_B[block_idx, 1]
+                dV = model.lora_A[block_idx, 2] @ model.lora_B[block_idx, 2]
+                dP = model.lora_A[block_idx, 3] @ model.lora_B[block_idx, 3]
+            else:
+                if model.config.joint_layers and model.joint_heads and model.joint_qkvp:
+                    dQ = torch.cat([model.lora_A@torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[0]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1)
+                    assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
+                    dK = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[1]*model.lora_C_l[block_idx])@ model.lora_B for head_idx in range(model.config.n_head)], dim=1)
+                    dV = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[2]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1) 
+                    dP = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[3]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1)
+                elif (not model.config.joint_layers) and model.joint_heads and model.joint_qkvp:
+                    dQ = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx,head_idx]*model.lora_C_m[block_idx,0])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
+                    assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
+                    dK = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx, head_idx]*model.lora_C_m[block_idx,1])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
+                    dV = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx,head_idx]*model.lora_C_m[block_idx,2])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1) 
+                    dP = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx, head_idx]*model.lora_C_m[block_idx,3])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
+                elif model.config.joint_layers and model.joint_heads and (not model.joint_qkvp):
+                    dQ = torch.cat([model.lora_A[0]@torch.diag(model.lora_C_h[0,head_idx]*model.lora_C_l[block_idx, 0])@model.lora_B[0] for head_idx in range(model.config.n_head)], dim=1)
+                    assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
+                    dK = torch.cat([model.lora_A[1] @torch.diag(model.lora_C_h[1, head_idx]*model.lora_C_l[block_idx, 1])@ model.lora_B[1] for head_idx in range(model.config.n_head)], dim=1)
+                    dV = torch.cat([model.lora_A[2] @torch.diag(model.lora_C_h[2, head_idx]*model.lora_C_l[block_idx, 2])@model.lora_B[2] for head_idx in range(model.config.n_head)], dim=1) 
+                    dP = torch.cat([model.lora_A[3] @torch.diag(model.lora_C_h[3, head_idx]*model.lora_C_l[block_idx, 3])@model.lora_B[3] for head_idx in range(model.config.n_head)], dim=1)
+            block.attn.attn.merge(dQ, dK, dV)
+            block.attn.proj.merge(dP)

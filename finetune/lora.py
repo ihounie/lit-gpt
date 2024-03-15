@@ -46,9 +46,9 @@ batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 5000  # train dataset size
+max_iters = 50000  # train dataset size
 weight_decay = 0.01
-lora_alpha = 16
+alpha = 16
 lora_dropout = 0.05
 lora_query = True
 lora_key = True
@@ -57,14 +57,14 @@ lora_projection = True
 lora_mlp = False
 lora_head = False
 warmup_steps = 100
-tensor_lora = False
+tensor_lora = True
 joint_heads = True
 joint_layers = True
 joint_qk_vp = False
 joint_qkvp = True
 #stochastic_layer_threshold = 0.5
 # evaluation
-eval_tasks= ["arc_challenge", "piqa", "hellaswag", "winogrande"]
+eval_tasks= ["arc_challenge", "piqa", "hellaswag"]#"winogrande"]
 num_fewshot=0
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -79,13 +79,15 @@ def setup(
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq"]] = None,
     learning_rate: float = 3e-4,
     alpha: int = 16,
-    tensor_lora: bool = False,
+    tensor_lora: bool = True,
     joint_heads: bool = True,
     joint_layers: bool = True,
     joint_qk_vp: bool = False,
     joint_qkvp: bool = True,
+    lora_dropout: float = 0.05,
     eval_tasks: Optional[List[str]] = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"],
     num_fewshot: int = 0,
+    init_scale: float = 1.0,
     #stochastic_layer_threshold: float = 0.5,
 ):
     precision = precision or get_default_supported_precision(training=True)
@@ -106,7 +108,7 @@ def setup(
     else:
         strategy = "auto"
     hparams["lora_r"] = rank
-    hparams["lora_alpha"] = alpha
+    hparams["alpha"] = alpha
     hparams["learning_rate"] = learning_rate
     #hparams["stochastic_layer_threshold"] = stochastic_layer_threshold
     hparams["tensor_lora"] = tensor_lora
@@ -116,12 +118,14 @@ def setup(
     hparams["joint_qkvp"] = joint_qkvp
     hparams["eval_tasks"] = eval_tasks
     hparams["num_fewshot"] = num_fewshot
+    hparams["lora_dropout"] = lora_dropout
+    hparams["init_scale"] = init_scale
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
-    fabric.launch(main, data_dir, checkpoint_dir, out_dir, quantize, rank)
+    fabric.launch(main, data_dir, checkpoint_dir, out_dir, quantize, rank, hparams=hparams)
 
-def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, quantize: Optional[str] = None, lora_r: int = 8):
+def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, quantize: Optional[str] = None, lora_r: int = 8, hparams=None):
     check_valid_checkpoint_dir(checkpoint_dir)
 
     speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
@@ -139,19 +143,20 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     config = Config.from_name(
         name=checkpoint_dir.name,
         r=lora_r,
-        alpha=lora_alpha,
-        dropout=lora_dropout,
+        alpha=hparams["alpha"],
+        dropout=hparams["lora_dropout"],
         to_query=lora_query,
         to_key=lora_key,
         to_value=lora_value,
         to_projection=lora_projection,
         to_mlp=lora_mlp,
         to_head=lora_head,
-        tensor_lora=tensor_lora,
-        joint_heads=joint_heads,
-        joint_layers=joint_layers,
-        joint_qk_vp=joint_qk_vp,
-        joint_qkvp=joint_qkvp,
+        tensor_lora=hparams["tensor_lora"],
+        joint_heads=hparams["joint_heads"],
+        joint_layers=hparams["joint_layers"],
+        joint_qk_vp=hparams["joint_qk_vp"],
+        joint_qkvp=hparams["joint_qkvp"],
+        init_scale=hparams["init_scale"],
         #stochastic_layer_threshold=stochastic_layer_threshold,
     )
     name = f"lora_r_{config.r}"
@@ -178,6 +183,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
     fabric.print(f"Number of non trainable parameters: {num_parameters(model, requires_grad=False):,}")
+    non_trainable = num_parameters(model, requires_grad=False)
+    lora = num_parameters(model, requires_grad=True)
+    wandb.log({"params/lora":lora,  "params/frac_lora": lora/(non_trainable+lora), "params/non_trainable": non_trainable})
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     if quantize and quantize.startswith("bnb."):
@@ -191,7 +199,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.seed_everything(1337 + fabric.global_rank)
 
     train_time = time.perf_counter()
-    #train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
+    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
@@ -199,22 +207,24 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     # Save the final LoRA checkpoint at the end of training
     save_path = checkpoint_dir / f"{name}_lora_finetuned.pth"
     save_lora_checkpoint(fabric, model, save_path)
+    wandb.save(str(save_path), policy='now')
 
-    eval_harness = EvalHarnessBase(
-        checkpoint_dir=str(checkpoint_dir),
-        model_file=f"{name}_lora_finetuned.pth",
-        quantize=quantize,
-    )
+    if len(eval_tasks)> 0:
+        eval_harness = EvalHarnessBase(
+            checkpoint_dir=str(checkpoint_dir),
+            model=model,
+            quantize=quantize,
+        )
 
-    results = eval_harness.run_eval(
-        eval_tasks="mmlu", num_fewshot=5, use_cache=False
-    )
-    wandb.log(results)
+    #results = eval_harness.run_eval(
+    #    eval_tasks=["hendrycksTest-*"], num_fewshot=5, use_cache=False
+    #)
+    #wandb.log(results['results'])
 
-    results = eval_harness.run_eval(
-        eval_tasks=eval_tasks, num_fewshot=num_fewshot, use_cache=False
-    )
-    wandb.log(results)
+        results = eval_harness.run_eval(
+            eval_tasks=eval_tasks, num_fewshot=num_fewshot, use_cache=False
+        )
+        wandb.log(results['results'])
 
 
 def train(
@@ -231,11 +241,11 @@ def train(
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
     model.max_seq_length = max_seq_length
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    #validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
-        mark_only_lora_as_trainable(meta_model)
+        #mark_only_lora_as_trainable(meta_model)
         # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
         # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
         # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
@@ -245,7 +255,7 @@ def train(
         # which is most likely false during finetuning
         x = torch.randint(0, 1, (micro_batch_size, longest_seq_length))
         measured_flops = measure_flops(meta_model, x)
-        fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
+        #fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
 
     step_count = 0
@@ -258,7 +268,6 @@ def train(
             lr = learning_rate * step_count / warmup_steps
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
-        model.config.stochastic_layer_threshold = iter_num / max_iters
 
         iter_t0 = time.perf_counter()
 
@@ -273,6 +282,9 @@ def train(
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
+        fabric.print(f"sum of grads Cl: {torch.sum(model.lora_C_l.grad)}")
+        #fabric.print(model.lora_C_m.grad)
+        #fabric.print(model.lora_C_h.grad)
 
         if not is_accumulating:
             optimizer.step()
@@ -385,6 +397,7 @@ def get_max_seq_length(data: List[Dict]) -> Tuple[int, int, int]:
 def save_lora_checkpoint(fabric, model, file_path: Path):
     fabric.print(f"Saving LoRA weights to {str(file_path)!r}")
     fabric.save(file_path, {"model": model}, filter={"model": lora_filter})
+
 
 
 if __name__ == "__main__":

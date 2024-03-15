@@ -34,6 +34,7 @@ class EvalHarnessBase(BaseLM):
         devices: int = 1,
         strategy: str = "auto",
         quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
+        model: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
         assert isinstance(device, str)
@@ -65,17 +66,21 @@ class EvalHarnessBase(BaseLM):
 
         fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
         t0 = time.perf_counter()
-        with fabric.init_module(empty_init=True), quantization(quantize):
-            model = GPT(config)
-        fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
+        if model is None:
+            with fabric.init_module(empty_init=True), quantization(quantize):
+                model = GPT(config)
+            fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
-        t0 = time.perf_counter()
-        with lazy_load(checkpoint_path) as checkpoint:
-            model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
-        fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
+            t0 = time.perf_counter()
+            with lazy_load(checkpoint_path) as checkpoint:
+                model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
+            fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
-        model.eval()
-        self.model = fabric.setup_module(model)
+            model.eval()
+            self.model = fabric.setup_module(model)
+        else:
+            model.eval()
+            self.model = model
         self.tokenizer = Tokenizer(checkpoint_dir)
         self.vocab_size = self.tokenizer.vocab_size
 
