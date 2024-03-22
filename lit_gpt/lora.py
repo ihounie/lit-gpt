@@ -605,9 +605,9 @@ class GPT(BaseModel):
                     #print(f"shapes A {self.lora_A.shape}, B {self.lora_B.shape}, C_h {self.lora_C_h.shape}, C_l {self.lora_C_l.shape}")
                     dQ = torch.cat([self.lora_A[0]@torch.diag(self.lora_C_h[head_idx, 0]*self.lora_C_l[block_idx, 0])@self.lora_B[0] for head_idx in range(self.config.n_head)], dim=1)
                     assert(dQ.shape == (self.config.n_embd, self.config.n_embd))
-                    dK = torch.cat([self.lora_A[1] @torch.diag(self.lora_C_h[head_idx, 1]+self.lora_C_l[block_idx, 1])@ self.lora_B[1] for head_idx in range(self.config.n_head)], dim=1)
-                    dV = torch.cat([self.lora_A[2] @torch.diag(self.lora_C_h[head_idx, 2]+self.lora_C_l[block_idx, 2])@self.lora_B[2] for head_idx in range(self.config.n_head)], dim=1) 
-                    dP = torch.cat([self.lora_A[3] @torch.diag(self.lora_C_h[head_idx, 3]+self.lora_C_l[block_idx, 3])@self.lora_B[3] for head_idx in range(self.config.n_head)], dim=1)
+                    dK = torch.cat([self.lora_A[1] @torch.diag(self.lora_C_h[head_idx, 1]*self.lora_C_l[block_idx, 1])@ self.lora_B[1] for head_idx in range(self.config.n_head)], dim=1)
+                    dV = torch.cat([self.lora_A[2] @torch.diag(self.lora_C_h[head_idx, 2]*self.lora_C_l[block_idx, 2])@self.lora_B[2] for head_idx in range(self.config.n_head)], dim=1) 
+                    dP = torch.cat([self.lora_A[3] @torch.diag(self.lora_C_h[head_idx, 3]*self.lora_C_l[block_idx, 3])@self.lora_B[3] for head_idx in range(self.config.n_head)], dim=1)
                 else:
                     raise NotImplementedError("Implemented joint heads and either joint qkvp or joint layers or the three of them at the same time. All other combinations are not implemented yet.")
             x = block(x, cos, sin, mask, input_pos, dQ, dK, dV, dP)
