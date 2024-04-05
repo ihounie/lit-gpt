@@ -85,7 +85,7 @@ def setup(
     joint_qk_vp: bool = False,
     joint_qkvp: bool = True,
     lora_dropout: float = 0.05,
-    eval_tasks: Optional[List[str]] = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"],
+    eval_tasks: Optional[List[str]] = ["arc_challenge", "piqa", "hellaswag"], # add  "hendrycksTest-*" to run MMLU
     num_fewshot: int = 0,
     init_scale: float = 1.0,
     #stochastic_layer_threshold: float = 0.5,
