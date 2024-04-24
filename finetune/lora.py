@@ -282,7 +282,7 @@ def train(
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
-        fabric.print(f"sum of grads Cl: {torch.sum(model.lora_C_l.grad)}")
+        #fabric.print(f"sum of grads Cl: {torch.sum(model.lora_C_l.grad)}")
         #fabric.print(model.lora_C_m.grad)
         #fabric.print(model.lora_C_h.grad)
 
