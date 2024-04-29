@@ -12,3 +12,4 @@ zstandard  # scripts/prepare_redpajama.py
 git+https://github.com/EleutherAI/lm-evaluation-harness.git@master  # eval
 pandas
 wandb
+lm_eval
