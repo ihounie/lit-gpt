@@ -7,6 +7,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
+from transformers import get_cosine_schedule_with_warmup
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -32,7 +33,7 @@ from eval.lm_eval_harness import EvalHarnessBase
 
 import wandb
 eval_interval = 100
-save_interval = 100
+save_interval = 1000
 eval_iters = 100
 eval_max_new_tokens = 100
 log_interval = 1
@@ -42,11 +43,11 @@ override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 128
+batch_size = 16
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000  # train dataset size
+max_iters = 5100 // micro_batch_size # train dataset size
 weight_decay = 0.01
 alpha = 16
 lora_dropout = 0.05
@@ -56,7 +57,7 @@ lora_value = True
 lora_projection = True
 lora_mlp = False
 lora_head = False
-warmup_steps = 100
+warmup_steps = int(0.1*max_iters*micro_batch_size//batch_size)
 tensor_lora = True
 joint_heads = True
 joint_layers = True
@@ -64,7 +65,7 @@ joint_qk_vp = False
 joint_qkvp = True
 #stochastic_layer_threshold = 0.5
 # evaluation
-eval_tasks= ["arc_challenge", "piqa", "hellaswag"]#"winogrande"]
+eval_tasks= []#"arc_challenge", "piqa", "hellaswag"]#"winogrande"]
 num_fewshot=0
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -85,9 +86,10 @@ def setup(
     joint_qk_vp: bool = False,
     joint_qkvp: bool = True,
     lora_dropout: float = 0.05,
-    eval_tasks: Optional[List[str]] = ["arc_challenge", "piqa", "hellaswag"], # add  "hendrycksTest-*" to run MMLU
+    eval_tasks: Optional[List[str]] = [],#["arc_challenge", "piqa", "hellaswag"], # add  "hendrycksTest-*" to run MMLU
     num_fewshot: int = 0,
     init_scale: float = 1.0,
+    micro_batch_size: int = 4,
     #stochastic_layer_threshold: float = 0.5,
 ):
     precision = precision or get_default_supported_precision(training=True)
@@ -120,6 +122,7 @@ def setup(
     hparams["num_fewshot"] = num_fewshot
     hparams["lora_dropout"] = lora_dropout
     hparams["init_scale"] = init_scale
+    hparams["micro_batch_size"] = micro_batch_size
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
@@ -194,12 +197,14 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         optimizer = bnb.optim.PagedAdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+
     model, optimizer = fabric.setup(model, optimizer)
+    scheduler  = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=max(1, hparams["warmup_steps"]), num_training_steps=int(hparams["max_iters"]//hparams["gradient_accumulation_iters"]))
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
     train_time = time.perf_counter()
-    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
+    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor, scheduler)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
@@ -236,6 +241,7 @@ def train(
     checkpoint_dir: Path,
     out_dir: Path,
     speed_monitor: SpeedMonitor,
+    scheduler,
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
@@ -263,11 +269,6 @@ def train(
     total_t0 = time.perf_counter()
 
     for iter_num in range(max_iters):
-        if step_count <= warmup_steps:
-            # linear warmup
-            lr = learning_rate * step_count / warmup_steps
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
 
         iter_t0 = time.perf_counter()
 
@@ -290,6 +291,9 @@ def train(
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
+            scheduler.step()
+            # log lr
+            wandb.log({"lr": optimizer.param_groups[0]["lr"]}, step=step_count)
 
         t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
