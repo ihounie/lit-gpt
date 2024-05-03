@@ -47,7 +47,7 @@ batch_size = 16
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 5100 // micro_batch_size # train dataset size
+max_iters = 51000 // micro_batch_size # train dataset size
 weight_decay = 0.01
 alpha = 16
 lora_dropout = 0.05
@@ -194,9 +194,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     if quantize and quantize.startswith("bnb."):
         import bitsandbytes as bnb
 
-        optimizer = bnb.optim.PagedAdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        optimizer = bnb.optim.PagedAdamW(trainable_params, lr=hparams["learning_rate"], weight_decay=weight_decay)
     else:
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(trainable_params, lr=hparams["learning_rate"], weight_decay=weight_decay)
 
     model, optimizer = fabric.setup(model, optimizer)
     scheduler  = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=max(1, hparams["warmup_steps"]), num_training_steps=int(hparams["max_iters"]//hparams["gradient_accumulation_iters"]))
