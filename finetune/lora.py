@@ -90,6 +90,7 @@ def setup(
     num_fewshot: int = 0,
     init_scale: float = 1.0,
     micro_batch_size: int = 4,
+    max_iters: int = 51000 // micro_batch_size,
     #stochastic_layer_threshold: float = 0.5,
 ):
     precision = precision or get_default_supported_precision(training=True)
@@ -123,6 +124,7 @@ def setup(
     hparams["lora_dropout"] = lora_dropout
     hparams["init_scale"] = init_scale
     hparams["micro_batch_size"] = micro_batch_size
+    hparams["max_iters"] = max_iters
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
@@ -268,7 +270,7 @@ def train(
     total_lengths = 0
     total_t0 = time.perf_counter()
 
-    for iter_num in range(max_iters):
+    for iter_num in range(hparams["max_iters"]):
 
         iter_t0 = time.perf_counter()
 
