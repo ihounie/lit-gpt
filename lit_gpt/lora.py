@@ -359,7 +359,9 @@ class LoRAQKVLinear(LoRALinear):
                 self.linear.weight.data += self.zero_pad(delta_w * self.scaling)  # (256, 128) after zero_pad (384, 128)
                 self.merged = True
             elif dQ is not None and dK is not None and dV is not None:
-                delta_w = torch.concatenate((dQ, dK, dV),  1)
+                delta_w = torch.concatenate((dQ, dK, dV),  0)
+                #print(delta_w.shape)
+                #print(self.linear.weight.data.shape)
                 self.linear.weight.data += delta_w * self.scaling  # (256, 128) after zero_pad (384, 128)
                 self.merged = True
             else:
@@ -852,19 +854,19 @@ def merge_lora_weights(model: GPT) -> None:
                 dV = model.lora_A[block_idx, 2] @ model.lora_B[block_idx, 2]
                 dP = model.lora_A[block_idx, 3] @ model.lora_B[block_idx, 3]
             else:
-                if model.config.joint_layers and model.joint_heads and model.joint_qkvp:
+                if model.config.joint_layers and model.config.joint_heads and model.config.joint_qkvp:
                     dQ = torch.cat([model.lora_A@torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[0]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1)
                     assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
                     dK = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[1]*model.lora_C_l[block_idx])@ model.lora_B for head_idx in range(model.config.n_head)], dim=1)
                     dV = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[2]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1) 
                     dP = torch.cat([model.lora_A @torch.diag(model.lora_C_h[head_idx]*model.lora_C_m[3]*model.lora_C_l[block_idx])@model.lora_B for head_idx in range(model.config.n_head)], dim=1)
-                elif (not model.config.joint_layers) and model.joint_heads and model.joint_qkvp:
+                elif (not model.config.joint_layers) and model.config.joint_heads and model.config.joint_qkvp:
                     dQ = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx,head_idx]*model.lora_C_m[block_idx,0])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
                     assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
                     dK = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx, head_idx]*model.lora_C_m[block_idx,1])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
                     dV = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx,head_idx]*model.lora_C_m[block_idx,2])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1) 
                     dP = torch.cat([model.lora_A[block_idx] @ torch.diag(model.lora_C_h[block_idx, head_idx]*model.lora_C_m[block_idx,3])@ model.lora_B[block_idx] for head_idx in range(model.config.n_head)], dim=1)
-                elif model.config.joint_layers and model.joint_heads and (not model.joint_qkvp):
+                elif model.config.joint_layers and model.config.joint_heads and (not model.config.joint_qkvp):
                     dQ = torch.cat([model.lora_A[0]@torch.diag(model.lora_C_h[0,head_idx]*model.lora_C_l[block_idx, 0])@model.lora_B[0] for head_idx in range(model.config.n_head)], dim=1)
                     assert(dQ.shape == (model.config.n_embd, model.config.n_embd))
                     dK = torch.cat([model.lora_A[1] @torch.diag(model.lora_C_h[1, head_idx]*model.lora_C_l[block_idx, 1])@ model.lora_B[1] for head_idx in range(model.config.n_head)], dim=1)
