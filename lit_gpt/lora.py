@@ -144,7 +144,7 @@ class LoRALinear(LoRALayer):
                 # Merge the weights and mark it
                 self.linear.weight.data += (self.lora_B @ self.lora_A) * self.scaling
             else:
-                self.linear.weight.data += dW * self.scaling
+                self.linear.weight.data += dW.T * self.scaling
             self.merged = True
 
     def forward(self, x: torch.Tensor, dW: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -359,10 +359,15 @@ class LoRAQKVLinear(LoRALinear):
                 self.linear.weight.data += self.zero_pad(delta_w * self.scaling)  # (256, 128) after zero_pad (384, 128)
                 self.merged = True
             elif dQ is not None and dK is not None and dV is not None:
-                delta_w = torch.concatenate((dQ, dK, dV),  0)
+                #print("dQ", dQ.shape)
+                #print("dK", dK.shape)
+                #print("dV", dV.shape)
+                delta_w = torch.concatenate((dQ, dK, dV),  1)
+                #print("delta_W", delta_w.shape)
+                #print("weight", self.linear.weight.data.shape)
                 #print(delta_w.shape)
                 #print(self.linear.weight.data.shape)
-                self.linear.weight.data += delta_w * self.scaling  # (256, 128) after zero_pad (384, 128)
+                self.linear.weight.data += delta_w.T * self.scaling  # (256, 128) after zero_pad (384, 128)
                 self.merged = True
             else:
                 raise NotImplementedError("all dQ, dK, dV have to be passed, padding not implemented")
